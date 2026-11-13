@@ -66,6 +66,72 @@ def _build_records() -> list[dict]:
 RECORDS = _build_records()
 
 
+# ---------------------------------------------------------------------------
+# 书目版本切换（admin）：用于演示“清理后重采旧版/同日在架/新版/删除”
+#
+# OVERRIDES: identifier -> version，取值：
+#   active-old    在架，datestamp 早于原始删除日（重采到更早版本，应被忽略）
+#   active-same   在架，datestamp 与原始删除日相同（同日冲突，保留撤下）
+#   active-new    在架，datestamp 晚于原始删除日（较新在架版本，重新上架）
+#   deleted-new   删除标记，datestamp 晚于原始删除日（较新删除，保持撤下）
+# ---------------------------------------------------------------------------
+OVERRIDE_VERSIONS = ("active-old", "active-same", "active-new", "deleted-new")
+_overrides_lock = threading.Lock()
+OVERRIDES: dict[str, str] = {}
+
+
+def _effective_record(record: dict) -> dict:
+    """应用 admin 版本覆盖，返回供本次响应使用的记录副本。"""
+    with _overrides_lock:
+        version = OVERRIDES.get(record["identifier"])
+    if version is None:
+        return record
+
+    base_day = datetime.strptime(record["datestamp"], "%Y-%m-%d").date()
+    effective = dict(record)
+    if version == "active-old":
+        effective.update(
+            deleted=False,
+            datestamp=(base_day - timedelta(days=1)).isoformat(),
+            title=f'{record["title"]}（旧版）',
+        )
+    elif version == "active-same":
+        effective.update(
+            deleted=False,
+            datestamp=record["datestamp"],
+            title=f'{record["title"]}（同日在架版）',
+        )
+    elif version == "active-new":
+        effective.update(
+            deleted=False,
+            datestamp=(base_day + timedelta(days=30)).isoformat(),
+            title=f'{record["title"]}（新版）',
+        )
+    elif version == "deleted-new":
+        effective.update(
+            deleted=True,
+            datestamp=(base_day + timedelta(days=30)).isoformat(),
+        )
+    return effective
+
+
+def _all_effective_records() -> list[dict]:
+    return [_effective_record(r) for r in RECORDS]
+
+
+def set_override(identifier: str, version: str | None) -> None:
+    with _overrides_lock:
+        if version is None:
+            OVERRIDES.pop(identifier, None)
+        else:
+            OVERRIDES[identifier] = version
+
+
+def overrides_snapshot() -> dict:
+    with _overrides_lock:
+        return dict(OVERRIDES)
+
+
 class TokenStore:
     """resumptionToken 的内存存储，带 TTL 与故障注入开关。"""
 
@@ -181,7 +247,7 @@ def _record_element(parent: ET.Element, record: dict) -> None:
 
 def _filter_records(from_date: str | None, until_date: str | None) -> list[dict]:
     result = []
-    for record in RECORDS:
+    for record in _all_effective_records():
         if from_date and record["datestamp"] < from_date:
             continue
         if until_date and record["datestamp"] > until_date:
@@ -249,7 +315,7 @@ def _list_records(qs: dict) -> bytes:
             "until": until_date,
         }
 
-    by_id = {r["identifier"]: r for r in RECORDS}
+    by_id = {r["identifier"]: r for r in _all_effective_records()}
     page_ids = ids[cursor:cursor + PAGE_SIZE]
     complete = len(ids)
     next_cursor = cursor + len(page_ids)
@@ -332,11 +398,12 @@ def _list_metadata_formats() -> bytes:
 
 def _get_record(qs: dict) -> bytes:
     identifier = qs.get("identifier", [None])[0]
-    record = next((r for r in RECORDS if r["identifier"] == identifier), None)
-    if record is None or qs.get("metadataPrefix", [None])[0] != "oai_dc":
+    base = next((r for r in RECORDS if r["identifier"] == identifier), None)
+    if base is None or qs.get("metadataPrefix", [None])[0] != "oai_dc":
         return _error_response(
             {"verb": "GetRecord"}, "idDoesNotExist", f"记录不存在：{identifier}"
         )
+    record = _effective_record(base)
     root = _envelope({"verb": "GetRecord", "metadataPrefix": "oai_dc"})
     get_el = ET.SubElement(root, f"{{{OAI_NS}}}GetRecord")
     _record_element(get_el, record)
@@ -363,13 +430,63 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _query(self) -> dict:
+    def _query(self) -> tuple[dict, str, bytes]:
         parsed = urlparse(self.path)
         if self.command == "POST":
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length).decode("UTF-8") if length else ""
-            return parse_qs(raw, keep_blank_values=True), parsed.path
-        return parse_qs(parsed.query, keep_blank_values=True), parsed.path
+            return parse_qs(raw, keep_blank_values=True), parsed.path, raw.encode("UTF-8")
+        return parse_qs(parsed.query, keep_blank_values=True), parsed.path, b""
+
+    def _handle_record_override(self, path: str, qs: dict, raw_body: bytes) -> None:
+        """PUT/POST /admin/records/<identifier>?version=... 切换书目版本。
+
+        version 缺省或为 default 时清除覆盖、恢复内置版本。
+        也支持 JSON 请求体 {"version": "..."}（Swagger 友好）。
+        """
+        import json
+
+        identifier = path[len("/admin/records/"):]
+        if not identifier:
+            self._send_json({"ok": False, "message": "缺少 identifier"}, 400)
+            return
+        if not any(r["identifier"] == identifier for r in RECORDS):
+            self._send_json(
+                {"ok": False, "message": f"记录不存在：{identifier}"}, 404
+            )
+            return
+
+        version = qs.get("version", [None])[0]
+        if self.command == "POST" and raw_body.strip():
+            try:
+                payload = json.loads(raw_body.decode("UTF-8"))
+            except json.JSONDecodeError as exc:
+                self._send_json(
+                    {"ok": False, "message": f"JSON 请求体无法解析：{exc}"}, 400
+                )
+                return
+            if isinstance(payload, dict) and payload.get("version"):
+                version = payload["version"]
+
+        if version in (None, "", "default"):
+            set_override(identifier, None)
+            self._send_json(
+                {"ok": True, "identifier": identifier, "version": "default",
+                 "message": "已恢复内置版本"}
+            )
+            return
+        if version not in OVERRIDE_VERSIONS:
+            self._send_json(
+                {"ok": False,
+                 "message": f"version 只支持 {OVERRIDE_VERSIONS + ('default',)}"},
+                400,
+            )
+            return
+        set_override(identifier, version)
+        self._send_json(
+            {"ok": True, "identifier": identifier, "version": version,
+             "message": f"已切换到 {version}；新令牌的后续翻页将返回该版本"}
+        )
 
     def do_GET(self) -> None:  # noqa: N802
         self._dispatch()
@@ -379,7 +496,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _dispatch(self) -> None:
         try:
-            qs, path = self._query()
+            qs, path, raw_body = self._query()
         except Exception as exc:  # pragma: no cover - 防御性
             self._send_xml(
                 _error_response({}, "badVerb", f"请求解析失败：{exc}"), 400
@@ -390,7 +507,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"status": "ok"})
             return
         if path == "/admin/state":
-            self._send_json(TOKENS.snapshot())
+            self._send_json({**TOKENS.snapshot(), "overrides": overrides_snapshot()})
             return
         if path == "/admin/fail-next":
             TOKENS.set_fail_next()
@@ -401,6 +518,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/admin/reset":
             TOKENS.reset()
             self._send_json({"ok": True, "message": "令牌库与故障开关已重置"})
+            return
+        if path.startswith("/admin/records/"):
+            self._handle_record_override(path, qs, raw_body)
             return
         if path != "/oai":
             self._send_xml(_error_response({}, "badVerb", f"未知路径：{path}"), 404)

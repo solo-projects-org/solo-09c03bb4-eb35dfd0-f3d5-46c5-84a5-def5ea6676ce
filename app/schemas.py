@@ -33,9 +33,31 @@ class HarvestResponse(BaseModel):
     inserted: int
     updated: int
     withdrawn: int = Field(..., description="因删除标记撤下的记录数")
+    skipped: int = Field(
+        ..., description="按守卫规则忽略的更早/同日冲突记录数（清理过的标识）"
+    )
     retries: int = Field(..., description="令牌失效后按原区间重抓的次数（0 或 1）")
     run_id: int
     note: str | None = None
+
+
+class CleanupRequest(BaseModel):
+    cutoff_date: str = Field(
+        ...,
+        alias="until",
+        description="清理截止日（含当天），格式 YYYY-MM-DD；只处理 datestamp 不晚于该日且仍撤下的书目",
+        examples=["2026-10-13"],
+    )
+
+    model_config = {"populate_by_name": True}
+
+
+class CleanupResponse(BaseModel):
+    cutoff_date: str = Field(..., description="实际使用的清理截止日（含当天）")
+    count: int = Field(..., description="本次实际清掉元数据的记录数")
+    cleared_identifiers: list[str] = Field(
+        ..., description="本次实际清掉元数据的 OAI 标识（撤下记录本身保留）"
+    )
 
 
 class ProgressResponse(BaseModel):
@@ -53,6 +75,10 @@ class BibRecordOut(BaseModel):
     creator: str | None
     date: str | None
     identifier_dc: str | None
+    write_guarded: bool = Field(
+        ..., description="元数据是否已被清理；为 true 时补采按库内 datestamp 守卫"
+    )
+    cleared_at: str | None = None
     updated_at: str
 
 
@@ -68,5 +94,6 @@ class RunOut(BaseModel):
     inserted: int
     updated: int
     withdrawn: int
+    skipped: int
     retries: int
     error: str | None

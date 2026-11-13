@@ -8,10 +8,13 @@ from datetime import date
 from fastapi import FastAPI, HTTPException, Query
 
 from . import db
+from .cleanup import cleanup_withdrawn
 from .harvester import HarvestConflictError, harvest
 from .oai_client import OAIClient, OAIError
 from .schemas import (
     BibRecordOut,
+    CleanupRequest,
+    CleanupResponse,
     HarvestRequest,
     HarvestResponse,
     ProgressResponse,
@@ -35,9 +38,12 @@ app = FastAPI(
         "通过 OAI-PMH ListRecords(oai_dc) 按日期补采单馆书目。\n\n"
         "- 首次采集另填起始日；之后从上次成功采集的截止日（含当天）续采\n"
         "- 续页只用 resumptionToken；令牌失效则丢弃已取页、按原区间重抓一次\n"
-        "- 整批采完才在一个事务内提交书目变更和截止日，无匹配也推进截止日"
+        "- 整批采完才在一个事务内提交书目变更和截止日，无匹配也推进截止日\n"
+        "- 留存期到期的撤下书目可经 /api/v1/cleanup 清空元数据、保留撤下记录；\n"
+        "  清理过的标识补采时按库内 datestamp 守卫：忽略更早记录、同日冲突保留\n"
+        "  撤下、较新在架版本可重新上架"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -92,6 +98,29 @@ def trigger_harvest(req: HarvestRequest) -> HarvestResponse:
             ) from exc
 
     return HarvestResponse(**summary.__dict__)
+
+
+@app.post(
+    "/api/v1/cleanup",
+    response_model=CleanupResponse,
+    summary="清理留存期到期的撤下书目元数据",
+    tags=["清理"],
+)
+def trigger_cleanup(req: CleanupRequest) -> CleanupResponse:
+    _validate_iso_date(req.cutoff_date, "截止日")
+    try:
+        summary = cleanup_withdrawn(req.cutoff_date)
+    except Exception as exc:
+        # 清理在单事务内整批提交，失败整体回滚，不留半批
+        raise HTTPException(
+            status_code=500,
+            detail=f"清理失败，本批变更已回滚：{exc}",
+        ) from exc
+    return CleanupResponse(
+        cutoff_date=summary.cutoff_date,
+        count=summary.count,
+        cleared_identifiers=summary.cleared,
+    )
 
 
 @app.get(

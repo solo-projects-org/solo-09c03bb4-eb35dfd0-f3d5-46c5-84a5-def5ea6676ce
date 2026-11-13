@@ -37,10 +37,79 @@ class HarvestSummary:
     inserted: int
     updated: int
     withdrawn: int
+    skipped: int
     retries: int
     run_id: int
     status: str = "success"
     note: str | None = None
+
+
+def _day(datestamp: str) -> str:
+    """日粒度：OAI 采集按天，比较只取 YYYY-MM-DD 前十位。"""
+    return (datestamp or "")[:10]
+
+
+def _apply_guarded_record(conn, record: OAIRecord) -> str:
+    """对清理过（write_guarded）的标识按库内 datestamp 决定写入。
+
+    返回 'skipped' / 'reactivated' / 'withdrawn'。
+
+    - 更早（incoming < 库内）：忽略，保留库内现状；
+    - 同日（incoming == 库内）：在架与撤下冲突时保留撤下状态，即同日
+      任何到来记录都不改库内状态（同日撤下到来同样跳过）；
+    - 更新（incoming > 库内）：
+        * 在架版本 -> 重新上架，写回完整 DC，守卫标记保留；
+        * 删除标记 -> 更新 datestamp 并保持撤下，不恢复元数据。
+    """
+    guarded = db.get_guarded_state(conn, record.identifier)
+    # 守卫标记可能在本批内已被较新在架记录处理；理论上仍能查到，防御性判空
+    if guarded is None:  # pragma: no cover - 防御性
+        return _apply_unguarded_record(conn, record)
+
+    incoming_day = _day(record.datestamp)
+    stored_day = _day(guarded["datestamp"])
+
+    if incoming_day < stored_day:
+        return "skipped"
+    if incoming_day == stored_day:
+        # 同日在架/撤下冲突：保留库内（撤下）状态，到来记录整体忽略
+        return "skipped"
+
+    # 较新版本
+    if record.deleted:
+        db.withdraw_bib_record(
+            conn, identifier=record.identifier, datestamp=record.datestamp
+        )
+        return "withdrawn"
+    db.upsert_bib_record(
+        conn,
+        identifier=record.identifier,
+        datestamp=record.datestamp,
+        fields=_first_values(record.dc),
+        raw_dc=json.dumps(record.dc, ensure_ascii=False),
+    )
+    return "reactivated"
+
+
+def _apply_unguarded_record(conn, record: OAIRecord) -> str:
+    """未清理标识沿用原采集语义：删除标记撤下，否则按标识 upsert。"""
+    if record.deleted:
+        if db.withdraw_bib_record(
+            conn, identifier=record.identifier, datestamp=record.datestamp
+        ):
+            return "withdrawn"
+        db.insert_withdrawn_tombstone(
+            conn, identifier=record.identifier, datestamp=record.datestamp
+        )
+        return "withdrawn"
+    outcome = db.upsert_bib_record(
+        conn,
+        identifier=record.identifier,
+        datestamp=record.datestamp,
+        fields=_first_values(record.dc),
+        raw_dc=json.dumps(record.dc, ensure_ascii=False),
+    )
+    return "inserted" if outcome == "inserted" else "updated"
 
 
 def _fetch_full_window(client: OAIClient, from_date: str | None,
@@ -138,46 +207,36 @@ def _harvest_locked(client: OAIClient, *, until_date: str,
 
         # 整批落库：单事务，任何异常整体回滚，半批数据不会入库
         with db.transaction(conn):
-            inserted = updated = withdrawn = 0
+            inserted = updated = withdrawn = skipped = 0
             for record in records:
-                if record.deleted:
-                    # 遇删除标记就撤下；库中不存在则落 withdrawn 墓碑
-                    if db.withdraw_bib_record(
-                        conn, identifier=record.identifier,
-                        datestamp=record.datestamp,
-                    ):
-                        withdrawn += 1
-                    else:
-                        db.insert_withdrawn_tombstone(
-                            conn, identifier=record.identifier,
-                            datestamp=record.datestamp,
-                        )
-                        withdrawn += 1
-                    continue
-                outcome = db.upsert_bib_record(
-                    conn,
-                    identifier=record.identifier,
-                    datestamp=record.datestamp,
-                    fields=_first_values(record.dc),
-                    raw_dc=json.dumps(record.dc, ensure_ascii=False),
-                )
-                if outcome == "inserted":
-                    inserted += 1
+                if db.get_guarded_state(conn, record.identifier) is not None:
+                    action = _apply_guarded_record(conn, record)
                 else:
+                    action = _apply_unguarded_record(conn, record)
+
+                if action == "inserted":
+                    inserted += 1
+                elif action in ("updated", "reactivated"):
+                    # reactivated：较新在架版本重新上架，计入更新
                     updated += 1
+                elif action == "withdrawn":
+                    withdrawn += 1
+                else:
+                    skipped += 1
 
             db.advance_progress(conn, until_date)
             db.finish_run(
                 conn, run_id, status="success", pages=pages,
                 fetched=len(records), inserted=inserted, updated=updated,
-                withdrawn=withdrawn, retries=retries, error=None,
+                withdrawn=withdrawn, skipped=skipped, retries=retries,
+                error=None,
             )
             conn.commit()
 
         logger.info(
-            "采集成功 区间=%s~%s 页=%d 取=%d 增=%d 改=%d 撤=%d 重抓=%d",
+            "采集成功 区间=%s~%s 页=%d 取=%d 增=%d 改=%d 撤=%d 忽略=%d 重抓=%d",
             effective_from, until_date, pages, len(records),
-            inserted, updated, withdrawn, retries,
+            inserted, updated, withdrawn, skipped, retries,
         )
         return HarvestSummary(
             from_date=effective_from or "",
@@ -187,6 +246,7 @@ def _harvest_locked(client: OAIClient, *, until_date: str,
             inserted=inserted,
             updated=updated,
             withdrawn=withdrawn,
+            skipped=skipped,
             retries=retries,
             run_id=run_id,
         )
@@ -201,7 +261,7 @@ def _harvest_locked(client: OAIClient, *, until_date: str,
                     db.finish_run(
                         fail_conn, run_id, status="failed",
                         pages=0, fetched=0, inserted=0, updated=0, withdrawn=0,
-                        retries=0, error=str(exc),
+                        skipped=0, retries=0, error=str(exc),
                     )
                     fail_conn.commit()
                 finally:
@@ -219,7 +279,7 @@ def _commit_empty_window(conn, run_id: int, from_date: str | None,
         db.advance_progress(conn, until_date)
         db.finish_run(
             conn, run_id, status="success", pages=0, fetched=0,
-            inserted=0, updated=0, withdrawn=0, retries=0, error=None,
+            inserted=0, updated=0, withdrawn=0, skipped=0, retries=0, error=None,
         )
         conn.commit()
     logger.info("区间 %s~%s 无匹配记录，截止日仍推进至 %s",
@@ -232,6 +292,7 @@ def _commit_empty_window(conn, run_id: int, from_date: str | None,
         inserted=0,
         updated=0,
         withdrawn=0,
+        skipped=0,
         retries=0,
         run_id=run_id,
         note="区间内无匹配记录，截止日已推进",

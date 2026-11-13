@@ -1,7 +1,6 @@
 """测试夹具：临时 SQLite + 独立端口的样例 OAI 源 + FastAPI TestClient。"""
 from __future__ import annotations
 
-import os
 import socket
 import sys
 import threading
@@ -28,16 +27,20 @@ def oai_server(monkeypatch, tmp_path):
     import importlib
 
     port = _free_port()
+    endpoint = f"http://127.0.0.1:{port}/oai"
     server_mod = importlib.import_module("server")
-    monkeypatch.setenv("BASE_URL", f"http://127.0.0.1:{port}/oai")
+    monkeypatch.setenv("BASE_URL", endpoint)
+    # 模块在导入时已读取 BASE_URL 环境变量，这里直接 patch 属性保持一致
+    monkeypatch.setattr(server_mod, "BASE_URL", endpoint)
     monkeypatch.setattr(server_mod, "PAGE_SIZE", 10)
     monkeypatch.setattr(server_mod, "TOKEN_TTL", 3600)
     monkeypatch.setattr(server_mod, "TOKENS", server_mod.TokenStore())
+    monkeypatch.setattr(server_mod, "OVERRIDES", {})
     httpd = ThreadingHTTPServer(("127.0.0.1", port), server_mod.Handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:
-        yield server_mod, f"http://127.0.0.1:{port}/oai"
+        yield server_mod, endpoint
     finally:
         httpd.shutdown()
         httpd.server_close()
